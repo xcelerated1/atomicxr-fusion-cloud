@@ -24,7 +24,7 @@ import { apiClient, download, pool, sleep, walk } from "../fusion-desktop/engine
 const here = path.dirname(fileURLToPath(import.meta.url));
 const cfgFile = process.env.FUSION_WORKER_CONFIG || path.join(here, "config.json");
 const cfg = { server: "https://atomicxr.com", nodeodm: "http://127.0.0.1:3001", workDir: path.join(here, "jobs"), workerId: `worker-${process.env.COMPUTERNAME || os.hostname() || "pc"}`, pollSeconds: 30, mode: "office", ...(existsSync(cfgFile) ? JSON.parse(readFileSync(cfgFile, "utf8")) : {}) };
-const ENV = { token: "FUSION_WORKER_TOKEN", server: "FUSION_SERVER", nodeodm: "FUSION_NODEODM", workDir: "FUSION_WORK_DIR", workerId: "FUSION_WORKER_ID", mode: "FUSION_WORKER_MODE", odmPython: "FUSION_ODM_PYTHON", odmPath: "FUSION_ODM_PATH" };
+const ENV = { token: "FUSION_WORKER_TOKEN", server: "FUSION_SERVER", nodeodm: "FUSION_NODEODM", workDir: "FUSION_WORK_DIR", workerId: "FUSION_WORKER_ID", mode: "FUSION_WORKER_MODE", odmPython: "FUSION_ODM_PYTHON", odmPath: "FUSION_ODM_PATH", maxPhotos: "FUSION_MAX_PHOTOS", maxGB: "FUSION_MAX_GB" };
 for (const [k, e] of Object.entries(ENV)) if (process.env[e]) cfg[k] = process.env[e];
 if (!cfg.token) throw new Error("No worker token (config.json token or FUSION_WORKER_TOKEN)");
 
@@ -194,7 +194,8 @@ async function main() {
   for (;;) {
     let claim;
     try {
-      claim = await api({ action: "claim", engine: `NodeODM ${info.version ?? "?"} / ODM ${info.engineVersion ?? "?"}` });
+      // Optional capacity (the Bunny container sets it; the office PC takes any size).
+      claim = await api({ action: "claim", engine: `NodeODM ${info.version ?? "?"} / ODM ${info.engineVersion ?? "?"}`, maxPhotos: Number(cfg.maxPhotos) || undefined, maxGB: Number(cfg.maxGB) || undefined });
     } catch (e) {
       log("claim failed:", e.message);
       await sleep(cfg.pollSeconds * 1000);
