@@ -153,7 +153,7 @@ async function processJob(job, images, expectBounds) {
     await mkdir(outDir, { recursive: true });
     await unzip(zip, outDir, log);
 
-    const stats = (f) => rasterStats(f, { python: cfg.odmPython, odmPath: cfg.odmPath, workDir: cfg.workDir, log });
+    const stats = (f, preview) => rasterStats(f, { python: cfg.odmPython, odmPath: cfg.odmPath, workDir: cfg.workDir, log, preview });
     const { layers, files } = await packageOutputs(outDir, expectBounds, stats);
     const workBytes = await dirBytes(dir);
     await publishOutputs({

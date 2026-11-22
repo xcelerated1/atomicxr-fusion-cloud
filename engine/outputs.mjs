@@ -3,7 +3,7 @@
  * Packages ODM outputs for upload (tiles + GeoTIFF + GLB + LAZ + report). Packaging only: says nothing about output quality.
  */
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -48,23 +48,49 @@ export async function unzip(zip, outDir, log = console.log) {
  * Elevation/raster statistics with GDAL from ODM's own Python — only measured values go to the viewer.
  * python: a .bat that sets up ODM's environment (NodeODM's helpers/odm_python.bat, or FUSION Desktop's copy).
  */
-export async function rasterStats(file, { python, odmPath, workDir, log = console.log }) {
+export async function rasterStats(file, { python, odmPath, workDir, log = console.log, preview = null }) {
   if (!python || !existsSync(python) || !existsSync(file)) return null;
   // validShare = share of pixels that have data (GDAL mask band, read downsampled to ≤1024 px wide).
+  // With a preview ({ out, kind: "ortho" | "dem" }) it also writes an image for visual review and measures:
+  //   ortho → sharpness = variance of the Laplacian over pixels with data (higher = crisper; relative, not calibrated)
+  //   dem   → hillshade PNG (spikes, pits and holes show plainly) + spikeShare = share of cells more than
+  //           max(2 m, 5 × MAD) from their 3×3 neighbourhood median.
   const code = [
     "import sys,json",
     "from osgeo import gdal",
     "ds=gdal.Open(sys.argv[1]);b=ds.GetRasterBand(1);mn,mx,mean,sd=b.ComputeStatistics(False);gt=ds.GetGeoTransform()",
     "W=min(1024,ds.RasterXSize);H=max(1,int(ds.RasterYSize*W/ds.RasterXSize))",
     "m=b.GetMaskBand().ReadRaster(0,0,ds.RasterXSize,ds.RasterYSize,W,H);v=sum(1 for c in m if c)/max(1,len(m))",
-    "print(json.dumps({'min':mn,'max':mx,'mean':mean,'resolution':abs(gt[1]),'width':ds.RasterXSize,'height':ds.RasterYSize,'validShare':round(v,3)}))",
+    "res={'min':mn,'max':mx,'mean':mean,'resolution':abs(gt[1]),'width':ds.RasterXSize,'height':ds.RasterYSize,'validShare':round(v,3)}",
+    "if len(sys.argv)>3:",
+    "  import numpy as np",
+    "  out,kind=sys.argv[2],sys.argv[3]",
+    "  PW=min(1600,ds.RasterXSize);PH=max(1,int(ds.RasterYSize*PW/ds.RasterXSize))",
+    "  if kind=='ortho':",
+    "    gdal.Translate(out,ds,format='JPEG',width=PW,height=PH,bandList=[1,2,3],creationOptions=['QUALITY=85'])",
+    "    g=ds.GetRasterBand(2).ReadAsArray(buf_xsize=PW,buf_ysize=PH).astype('float32')",
+    "    mk=ds.GetRasterBand(1).GetMaskBand().ReadAsArray(buf_xsize=PW,buf_ysize=PH)[1:-1,1:-1]>0",
+    "    lap=4*g[1:-1,1:-1]-g[:-2,1:-1]-g[2:,1:-1]-g[1:-1,:-2]-g[1:-1,2:]",
+    "    res['sharpness']=round(float(np.var(lap[mk])),1) if mk.any() else None",
+    "  else:",
+    "    small=gdal.Translate('/vsimem/dem.tif',ds,width=PW,height=PH,resampleAlg='average')",
+    "    hs=gdal.DEMProcessing('/vsimem/hs.tif',small,'hillshade',computeEdges=True)",
+    "    gdal.Translate(out,hs,format='PNG')",
+    "    sb=small.GetRasterBand(1);z=sb.ReadAsArray().astype('float64');ok=sb.GetMaskBand().ReadAsArray()>0",
+    "    zf=np.where(ok,z,np.nan);pad=np.pad(zf,1,mode='edge')",
+    "    stack=np.stack([pad[i:i+zf.shape[0],j:j+zf.shape[1]] for i in range(3) for j in range(3)])",
+    "    med=np.nanmedian(stack,axis=0);d=np.abs(zf-med);dv=d[ok & ~np.isnan(d)]",
+    "    if dv.size:",
+    "      mad=float(np.median(dv));thr=max(2.0,5*mad);res['spikeShare']=round(float((dv>thr).mean()),4);res['spikeThresholdM']=round(thr,2)",
+    "print(json.dumps(res))",
   ].join("\n");
   const script = path.join(workDir, "raster_stats.py");
   await mkdir(workDir, { recursive: true });
   await writeFile(script, code);
   try {
     const bat = /\.bat$/i.test(python);
-    const { stdout } = await run(bat ? "cmd.exe" : python, bat ? ["/d", "/c", python, script, file] : [script, file], {
+    const args = preview ? [file, preview.out, preview.kind] : [file];
+    const { stdout } = await run(bat ? "cmd.exe" : python, bat ? ["/d", "/c", python, script, ...args] : [script, ...args], {
       timeout: 300_000,
       maxBuffer: 1 << 20,
       env: { ...process.env, ODM_PATH: odmPath ?? process.env.ODM_PATH ?? "" },
@@ -123,14 +149,27 @@ export async function packageOutputs(outDir, expectBounds, stats) {
     return t ? { tiles: `${kind.toLowerCase()}/tiles`, minZoom: t.minZoom, maxZoom: t.maxZoom, bounds: t.bounds, scheme: t.scheme, ...extra } : extra;
   };
 
+  // Preview images for visual review (written next to the outputs, uploaded with the layer).
+  const pvDir = path.join(outDir, "fusion_previews");
+  const preview = (kind, rel) => {
+    const out = path.join(pvDir, rel.replace(/\//g, "_"));
+    return { out, rel, kind };
+  };
+  const attachPreview = (pv, st, layerKind) => (st && existsSync(pv.out) ? add(pv.rel, pv.out, layerKind, "preview") : null);
+  if (existsSync(outDir)) { try { mkdirSync(pvDir, { recursive: true }); } catch {} }
+
   if (has("odm_orthophoto/odm_orthophoto.tif")) {
     const t = await tiles("ORTHOMOSAIC", "orthophoto_tiles", {});
-    const st = await stats(path.join(outDir, "odm_orthophoto/odm_orthophoto.tif"));
-    layers.push({ kind: "ORTHOMOSAIC", title: "2D Map (orthomosaic)", ...t, file: add("orthomosaic/orthophoto.tif", path.join(outDir, "odm_orthophoto/odm_orthophoto.tif"), "ORTHOMOSAIC", "file"), fileBytes: size("odm_orthophoto/odm_orthophoto.tif"), meta: { scheme: t.scheme ?? "xyz", resolutionM: st?.resolution ?? null, pixels: st ? [st.width, st.height] : null, validShare: st?.validShare ?? null, processing } });
+    const pv = preview("ortho", "orthomosaic/preview.jpg");
+    const st = await stats(path.join(outDir, "odm_orthophoto/odm_orthophoto.tif"), pv);
+    const pvRel = attachPreview(pv, st, "ORTHOMOSAIC");
+    layers.push({ kind: "ORTHOMOSAIC", title: "2D Map (orthomosaic)", ...t, file: add("orthomosaic/orthophoto.tif", path.join(outDir, "odm_orthophoto/odm_orthophoto.tif"), "ORTHOMOSAIC", "file"), fileBytes: size("odm_orthophoto/odm_orthophoto.tif"), meta: { scheme: t.scheme ?? "xyz", resolutionM: st?.resolution ?? null, pixels: st ? [st.width, st.height] : null, validShare: st?.validShare ?? null, sharpness: st?.sharpness ?? null, preview: pvRel, processing } });
   }
   for (const [kind, name, surface] of [["DSM", "dsm", "surface"], ["DTM", "dtm", "terrain"]]) {
     if (!has(`odm_dem/${name}.tif`)) continue;
-    const st = await stats(path.join(outDir, `odm_dem/${name}.tif`));
+    const pv = preview("dem", `${kind.toLowerCase()}/preview.png`);
+    const st = await stats(path.join(outDir, `odm_dem/${name}.tif`), pv);
+    const pvRel = attachPreview(pv, st, kind);
     const t = await tiles(kind, `${name}_tiles`, {});
     layers.push({
       kind,
@@ -138,7 +177,7 @@ export async function packageOutputs(outDir, expectBounds, stats) {
       ...t,
       file: add(`${kind.toLowerCase()}/${name}.tif`, path.join(outDir, `odm_dem/${name}.tif`), kind, "file"),
       fileBytes: size(`odm_dem/${name}.tif`),
-      meta: { scheme: t.scheme ?? "xyz", surface, unit: "m", min: st?.min ?? null, max: st?.max ?? null, resolutionM: st?.resolution ?? null, validShare: st?.validShare ?? null, processing, datum: "GPS ellipsoid/EGM heights as recorded by the drone (not a surveyed datum)" },
+      meta: { scheme: t.scheme ?? "xyz", surface, unit: "m", min: st?.min ?? null, max: st?.max ?? null, resolutionM: st?.resolution ?? null, validShare: st?.validShare ?? null, spikeShare: st?.spikeShare ?? null, spikeThresholdM: st?.spikeThresholdM ?? null, preview: pvRel, processing, datum: "GPS ellipsoid/EGM heights as recorded by the drone (not a surveyed datum)" },
     });
   }
   const glb = ["odm_texturing/odm_textured_model_geo.glb", "odm_texturing_25d/odm_textured_model_geo.glb"].find(has);
