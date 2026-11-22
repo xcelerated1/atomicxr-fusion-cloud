@@ -52,11 +52,11 @@ export function apiClient(cfg) {
   };
 }
 
-export async function download(url, file, bytes) {
+export async function download(url, file, bytes, headers = undefined) {
   if (existsSync(file) && (!bytes || statSync(file).size === bytes)) return;
   for (let attempt = 0; ; attempt++) {
     try {
-      const r = await fetch(url);
+      const r = await fetch(url, headers ? { headers } : undefined);
       if (!r.ok || !r.body) throw new Error(`download ${r.status}`);
       await pipeline(Readable.fromWeb(r.body), createWriteStream(`${file}.part`));
       await rename(`${file}.part`, file);

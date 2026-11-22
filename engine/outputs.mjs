@@ -4,7 +4,7 @@
  */
 import { execFile } from "node:child_process";
 import { mkdirSync, existsSync, readFileSync, statSync } from "node:fs";
-import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { pool, upload, walk } from "./util.mjs";
@@ -113,6 +113,52 @@ export async function rasterStats(file, { python, odmPath, workDir, log = consol
   }
 }
 
+/** PDAL (ships with OpenDroneMap): FUSION Desktop / office PC under ODM's SuperBuild, the cloud image under /code. */
+export function pdalPath(odmPath) {
+  const exe = process.platform === "win32" ? "pdal.exe" : "pdal";
+  return [odmPath && path.join(odmPath, "SuperBuild", "install", "bin", exe), path.join("/code", "SuperBuild", "install", "bin", exe), "/usr/local/bin/pdal", "/usr/bin/pdal"].find((p) => p && existsSync(p)) ?? null;
+}
+
+/**
+ * Web inspection copy of a point cloud: ≤ maxPoints, shifted into the 3D model's local frame (ODM's coords.txt
+ * offset, the same origin as its GLB) so float32 keeps millimetres and the cloud lines up with the model,
+ * written as binary PLY (x, y, z, colour, ODM class). The full LAZ stays the deliverable.
+ * Returns { count, kept, offset, offsetSource, bounds } or null.
+ */
+export async function cloudPreview(laz, out, { odmPath, coordsFile = null, maxPoints = 1_500_000, log = console.log } = {}) {
+  const pdal = pdalPath(odmPath);
+  if (!pdal || !existsSync(laz)) return null;
+  try {
+    const opts = { timeout: 900_000, maxBuffer: 64 << 20, cwd: path.dirname(pdal) };
+    const info = JSON.parse((await run(pdal, ["info", "--metadata", laz], opts)).stdout);
+    const md = info.metadata ?? {};
+    const count = Number(md.count) || 0;
+    let offset = [Number(md.offset_x) || 0, Number(md.offset_y) || 0];
+    let offsetSource = "las-header";
+    if (coordsFile && existsSync(coordsFile)) {
+      const m = readFileSync(coordsFile, "utf8").split(/\r?\n/)[1]?.trim().split(/\s+/).map(Number);
+      if (m?.length >= 2 && m.every(Number.isFinite)) (offset = [m[0], m[1]]), (offsetSource = "odm-coords");
+    }
+    const step = Math.max(1, Math.ceil(count / maxPoints));
+    const pipeline = [
+      { type: "readers.las", filename: laz },
+      ...(step > 1 ? [{ type: "filters.decimation", step }] : []),
+      { type: "filters.transformation", matrix: `1 0 0 ${-offset[0]} 0 1 0 ${-offset[1]} 0 0 1 0 0 0 0 1` },
+      { type: "writers.ply", filename: out, storage_mode: "little endian", dims: "X=float32,Y=float32,Z=float32,Red=uint8,Green=uint8,Blue=uint8,Classification=uint8" },
+    ];
+    const pj = `${out}.pipeline.json`;
+    await writeFile(pj, JSON.stringify({ pipeline }));
+    await run(pdal, ["pipeline", pj], opts);
+    await rm(pj, { force: true }).catch(() => {});
+    if (!existsSync(out)) return null;
+    const b = { minx: md.minx, maxx: md.maxx, miny: md.miny, maxy: md.maxy, minz: md.minz, maxz: md.maxz };
+    return { count, kept: Math.ceil(count / step), step, offset, offsetSource, bounds: b, bytes: statSync(out).size };
+  } catch (e) {
+    log("point cloud preview failed", laz, e.message);
+    return null;
+  }
+}
+
 /**
  * Package an ODM project folder (or NodeODM's unzipped all.zip, same layout) into FUSION layers.
  * Returns { layers, files: [[rel, abs, kind, part]] } where part is "tiles" or "file".
@@ -141,7 +187,7 @@ export function processingStats(outDir) {
   }
 }
 
-export async function packageOutputs(outDir, expectBounds, stats) {
+export async function packageOutputs(outDir, expectBounds, stats, opts = {}) {
   const processing = processingStats(outDir);
   const layers = [];
   const files = [];
@@ -193,7 +239,13 @@ export async function packageOutputs(outDir, expectBounds, stats) {
   }
   const glb = ["odm_texturing/odm_textured_model_geo.glb", "odm_texturing_25d/odm_textured_model_geo.glb"].find(has);
   if (glb) layers.push({ kind: "MODEL_3D", title: "3D Model", file: add("model3d/model.glb", path.join(outDir, glb), "MODEL_3D", "file"), fileBytes: size(glb), meta: { format: "glb", source: glb.includes("25d") ? "2.5D" : "full 3D", processing } });
-  if (has("odm_georeferencing/odm_georeferenced_model.laz")) layers.push({ kind: "POINT_CLOUD", title: "Point cloud", file: add("pointcloud/points.laz", path.join(outDir, "odm_georeferencing/odm_georeferenced_model.laz"), "POINT_CLOUD", "file"), fileBytes: size("odm_georeferencing/odm_georeferenced_model.laz"), meta: { format: "laz", processing } });
+  if (has("odm_georeferencing/odm_georeferenced_model.laz")) {
+    const laz = path.join(outDir, "odm_georeferencing/odm_georeferenced_model.laz");
+    // Web inspection copy (decimated, in the 3D model's frame) so the cloud can be checked inside FUSION.
+    const web = opts.cloudPreview ? await cloudPreview(laz, path.join(pvDir, "pointcloud_web.ply"), { odmPath: opts.odmPath, coordsFile: path.join(outDir, "odm_georeferencing/coords.txt"), log: opts.log }) : null;
+    const webRel = web ? add("pointcloud/web.ply", path.join(pvDir, "pointcloud_web.ply"), "POINT_CLOUD", "preview") : null;
+    layers.push({ kind: "POINT_CLOUD", title: "Point cloud", file: add("pointcloud/points.laz", laz, "POINT_CLOUD", "file"), fileBytes: size("odm_georeferencing/odm_georeferenced_model.laz"), meta: { format: "laz", processing, web: webRel, webCloud: web ? { points: web.count, shown: web.kept, offset: web.offset, offsetSource: web.offsetSource, bounds: web.bounds } : null } });
+  }
   if (has("odm_report/report.pdf")) layers.push({ kind: "REPORT", title: "Processing report (OpenDroneMap)", file: add("report/odm-report.pdf", path.join(outDir, "odm_report/report.pdf"), "REPORT", "file"), fileBytes: size("odm_report/report.pdf"), meta: {} });
   if (!layers.length) throw Object.assign(new Error("The mapping engine finished but produced no usable outputs."), { retryable: false });
   return { layers, files };
@@ -219,7 +271,7 @@ export function selectOutputs({ layers, files }, skip = new Set()) {
  * Upload outputs with signed URLs, then "finish" with the full upload list: atomicxr.com checks every file is
  * in storage with the right size before it attaches the layers. Missing files are re-sent (up to 2 rounds).
  */
-export async function publishOutputs({ api, jobId, layers, files, usage, onProgress = async () => {}, log = console.log }) {
+export async function publishOutputs({ api, jobId, layers, files, usage, extra = {}, onProgress = async () => {}, log = console.log }) {
   let sent = 0;
   const total = files.length;
   const sendAll = async (list) => {
@@ -237,7 +289,7 @@ export async function publishOutputs({ api, jobId, layers, files, usage, onProgr
   const { where } = await api({ action: "presign", jobId, files: [] });
   const uploaded = files.map(([rel, abs]) => ({ rel, bytes: statSync(abs).size }));
   for (let round = 0; ; round++) {
-    const r = await api({ action: "finish", jobId, ok: true, where, layers, usage, uploaded });
+    const r = await api({ action: "finish", jobId, ok: true, where, layers, usage, uploaded, ...extra });
     if (r.status !== 409) return { where, verified: uploaded.length };
     if (round >= 2) throw new Error(`Storage check: ${r.count ?? r.missing?.length} file(s) still missing after re-sending.`);
     log(`storage check: re-sending ${r.missing.length} file(s)`);
