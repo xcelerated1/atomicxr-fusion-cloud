@@ -1,6 +1,6 @@
 /**
  * OpenDroneMap results → FUSION layers, and the verified upload to atomicxr.com.
- * Same packaging the office worker used for the tested grandstand job (tiles + GeoTIFF + GLB + LAZ + report).
+ * Packages ODM outputs for upload (tiles + GeoTIFF + GLB + LAZ + report). Packaging only: says nothing about output quality.
  */
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -50,7 +50,15 @@ export async function unzip(zip, outDir, log = console.log) {
  */
 export async function rasterStats(file, { python, odmPath, workDir, log = console.log }) {
   if (!python || !existsSync(python) || !existsSync(file)) return null;
-  const code = "import sys,json\nfrom osgeo import gdal\nds=gdal.Open(sys.argv[1]);b=ds.GetRasterBand(1);mn,mx,mean,sd=b.ComputeStatistics(False);gt=ds.GetGeoTransform();print(json.dumps({'min':mn,'max':mx,'mean':mean,'resolution':abs(gt[1]),'width':ds.RasterXSize,'height':ds.RasterYSize}))";
+  // validShare = share of pixels that have data (GDAL mask band, read downsampled to ≤1024 px wide).
+  const code = [
+    "import sys,json",
+    "from osgeo import gdal",
+    "ds=gdal.Open(sys.argv[1]);b=ds.GetRasterBand(1);mn,mx,mean,sd=b.ComputeStatistics(False);gt=ds.GetGeoTransform()",
+    "W=min(1024,ds.RasterXSize);H=max(1,int(ds.RasterYSize*W/ds.RasterXSize))",
+    "m=b.GetMaskBand().ReadRaster(0,0,ds.RasterXSize,ds.RasterYSize,W,H);v=sum(1 for c in m if c)/max(1,len(m))",
+    "print(json.dumps({'min':mn,'max':mx,'mean':mean,'resolution':abs(gt[1]),'width':ds.RasterXSize,'height':ds.RasterYSize,'validShare':round(v,3)}))",
+  ].join("\n");
   const script = path.join(workDir, "raster_stats.py");
   await mkdir(workDir, { recursive: true });
   await writeFile(script, code);
@@ -72,7 +80,32 @@ export async function rasterStats(file, { python, odmPath, workDir, log = consol
  * Package an ODM project folder (or NodeODM's unzipped all.zip, same layout) into FUSION layers.
  * Returns { layers, files: [[rel, abs, kind, part]] } where part is "tiles" or "file".
  */
+/** OpenDroneMap's own reconstruction statistics (odm_report/stats.json), reduced to what quality checks use. */
+export function processingStats(outDir) {
+  const file = path.join(outDir, "odm_report", "stats.json");
+  if (!existsSync(file)) return null;
+  try {
+    const j = JSON.parse(readFileSync(file, "utf8"));
+    const r = j.reconstruction_statistics ?? {};
+    const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+    const gps = j.gps_errors ?? {};
+    const gcp = j.gcp_errors ?? {};
+    return {
+      shotsTotal: num(r.initial_shots_count),
+      shotsReconstructed: num(r.reconstructed_shots_count),
+      pointsReconstructed: num(r.reconstructed_points_count),
+      components: num(r.components),
+      gpsErrorM: num(gps.average_error),
+      reprojectionErrorPx: num(r.reprojection_error_pixels),
+      gcpUsed: Boolean(gcp && Object.keys(gcp).length && num(gcp.average_error) != null),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function packageOutputs(outDir, expectBounds, stats) {
+  const processing = processingStats(outDir);
   const layers = [];
   const files = [];
   const add = (rel, abs, kind, part) => { files.push([rel, abs, kind, part]); return rel; };
@@ -93,7 +126,7 @@ export async function packageOutputs(outDir, expectBounds, stats) {
   if (has("odm_orthophoto/odm_orthophoto.tif")) {
     const t = await tiles("ORTHOMOSAIC", "orthophoto_tiles", {});
     const st = await stats(path.join(outDir, "odm_orthophoto/odm_orthophoto.tif"));
-    layers.push({ kind: "ORTHOMOSAIC", title: "2D Map (orthomosaic)", ...t, file: add("orthomosaic/orthophoto.tif", path.join(outDir, "odm_orthophoto/odm_orthophoto.tif"), "ORTHOMOSAIC", "file"), fileBytes: size("odm_orthophoto/odm_orthophoto.tif"), meta: { scheme: t.scheme ?? "xyz", resolutionM: st?.resolution ?? null, pixels: st ? [st.width, st.height] : null } });
+    layers.push({ kind: "ORTHOMOSAIC", title: "2D Map (orthomosaic)", ...t, file: add("orthomosaic/orthophoto.tif", path.join(outDir, "odm_orthophoto/odm_orthophoto.tif"), "ORTHOMOSAIC", "file"), fileBytes: size("odm_orthophoto/odm_orthophoto.tif"), meta: { scheme: t.scheme ?? "xyz", resolutionM: st?.resolution ?? null, pixels: st ? [st.width, st.height] : null, validShare: st?.validShare ?? null, processing } });
   }
   for (const [kind, name, surface] of [["DSM", "dsm", "surface"], ["DTM", "dtm", "terrain"]]) {
     if (!has(`odm_dem/${name}.tif`)) continue;
@@ -105,12 +138,12 @@ export async function packageOutputs(outDir, expectBounds, stats) {
       ...t,
       file: add(`${kind.toLowerCase()}/${name}.tif`, path.join(outDir, `odm_dem/${name}.tif`), kind, "file"),
       fileBytes: size(`odm_dem/${name}.tif`),
-      meta: { scheme: t.scheme ?? "xyz", surface, unit: "m", min: st?.min ?? null, max: st?.max ?? null, resolutionM: st?.resolution ?? null, datum: "GPS ellipsoid/EGM heights as recorded by the drone (not a surveyed datum)" },
+      meta: { scheme: t.scheme ?? "xyz", surface, unit: "m", min: st?.min ?? null, max: st?.max ?? null, resolutionM: st?.resolution ?? null, validShare: st?.validShare ?? null, processing, datum: "GPS ellipsoid/EGM heights as recorded by the drone (not a surveyed datum)" },
     });
   }
   const glb = ["odm_texturing/odm_textured_model_geo.glb", "odm_texturing_25d/odm_textured_model_geo.glb"].find(has);
-  if (glb) layers.push({ kind: "MODEL_3D", title: "3D Model", file: add("model3d/model.glb", path.join(outDir, glb), "MODEL_3D", "file"), fileBytes: size(glb), meta: { format: "glb", source: glb.includes("25d") ? "2.5D" : "full 3D" } });
-  if (has("odm_georeferencing/odm_georeferenced_model.laz")) layers.push({ kind: "POINT_CLOUD", title: "Point cloud", file: add("pointcloud/points.laz", path.join(outDir, "odm_georeferencing/odm_georeferenced_model.laz"), "POINT_CLOUD", "file"), fileBytes: size("odm_georeferencing/odm_georeferenced_model.laz"), meta: { format: "laz" } });
+  if (glb) layers.push({ kind: "MODEL_3D", title: "3D Model", file: add("model3d/model.glb", path.join(outDir, glb), "MODEL_3D", "file"), fileBytes: size(glb), meta: { format: "glb", source: glb.includes("25d") ? "2.5D" : "full 3D", processing } });
+  if (has("odm_georeferencing/odm_georeferenced_model.laz")) layers.push({ kind: "POINT_CLOUD", title: "Point cloud", file: add("pointcloud/points.laz", path.join(outDir, "odm_georeferencing/odm_georeferenced_model.laz"), "POINT_CLOUD", "file"), fileBytes: size("odm_georeferencing/odm_georeferenced_model.laz"), meta: { format: "laz", processing } });
   if (has("odm_report/report.pdf")) layers.push({ kind: "REPORT", title: "Processing report (OpenDroneMap)", file: add("report/odm-report.pdf", path.join(outDir, "odm_report/report.pdf"), "REPORT", "file"), fileBytes: size("odm_report/report.pdf"), meta: {} });
   if (!layers.length) throw Object.assign(new Error("The mapping engine finished but produced no usable outputs."), { retryable: false });
   return { layers, files };
