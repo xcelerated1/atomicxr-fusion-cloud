@@ -13,7 +13,7 @@
  *   { server, token, nodeodm, workDir, workerId, odmPython?, odmPath?, mode? ("cloud" | "office") }
  * Shared engine code: ../fusion-desktop/engine (same packaging/upload FUSION Desktop uses).
  */
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, statfsSync } from "node:fs";
 import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -82,7 +82,11 @@ async function processJob(job, images, expectBounds) {
   // Peak memory in use on this machine while the job runs (to size FUSION Cloud limits from real numbers).
   const baseUsed = os.totalmem() - os.freemem();
   let peakUsed = baseUsed;
-  const memTimer = setInterval(() => { peakUsed = Math.max(peakUsed, os.totalmem() - os.freemem()); }, 5000);
+  // Peak disk in use on the work filesystem (cloud containers have 10 GiB): measured, so limits come from data.
+  const diskUsed = () => { try { const st = statfsSync(cfg.workDir); return (st.blocks - st.bfree) * st.bsize; } catch { return 0; } };
+  const baseDisk = diskUsed();
+  let peakDisk = baseDisk;
+  const memTimer = setInterval(() => { peakUsed = Math.max(peakUsed, os.totalmem() - os.freemem()); peakDisk = Math.max(peakDisk, diskUsed()); }, 5000);
   const progress = async (p, stage, extra = {}) => {
     const r = await api({ action: "progress", jobId: job.id, progress: p, stage, ...extra }).catch(() => ({}));
     if (r.canceled) canceled = true;
@@ -112,7 +116,9 @@ async function processJob(job, images, expectBounds) {
       if (canceled) return { canceled: true };
 
       // NodeODM task: options are ODM's own names.
-      const options = Object.entries(job.options || {}).map(([k, value]) => ({ name: k, value }));
+      // In the cloud container disk is small (10 GiB): let ODM delete heavy intermediate files as it goes.
+      const opts = { ...(job.options || {}), ...(cfg.mode === "cloud" ? { "optimize-disk-space": true } : {}) };
+      const options = Object.entries(opts).map(([k, value]) => ({ name: k, value }));
       const init = await odm("/task/new/init", { method: "POST", body: form({ name, options: JSON.stringify(options), skipPostProcessing: "false" }) });
       uuid = init.uuid;
       await writeFile(taskFile, uuid);
@@ -124,6 +130,8 @@ async function processJob(job, images, expectBounds) {
         await odm(`/task/new/upload/${uuid}`, { method: "POST", body: fd });
       }
       await odm(`/task/new/commit/${uuid}`, { method: "POST" });
+      // The engine has its own copy now.
+      if (cfg.mode === "cloud") await rm(imgDir, { recursive: true, force: true }).catch(() => {});
     }
 
     let info;
@@ -148,10 +156,13 @@ async function processJob(job, images, expectBounds) {
     const zip = path.join(dir, "all.zip");
     await rm(zip, { force: true }); // never reuse results from an earlier attempt
     await download(`${cfg.nodeodm}/task/${uuid}/download/all.zip`, zip);
+    // Cloud: free the engine's working folder (the biggest) before unpacking, and the zip after.
+    if (cfg.mode === "cloud") await odm("/task/remove", { method: "POST", body: form({ uuid }) }).catch((e) => log("task remove failed:", e.message));
     const outDir = path.join(dir, "out");
     await rm(outDir, { recursive: true, force: true });
     await mkdir(outDir, { recursive: true });
     await unzip(zip, outDir, log);
+    if (cfg.mode === "cloud") await rm(zip, { force: true }).catch(() => {});
 
     const stats = (f, preview) => rasterStats(f, { python: cfg.odmPython, odmPath: cfg.odmPath, workDir: cfg.workDir, log, preview });
     const { layers, files } = await packageOutputs(outDir, expectBounds, stats);
@@ -173,6 +184,7 @@ async function processJob(job, images, expectBounds) {
         runner: cfg.mode,
         workerId: cfg.workerId,
         peakMemGB: +((peakUsed - baseUsed) / 1024 ** 3).toFixed(2),
+        peakDiskGB: +((peakDisk - baseDisk) / 1024 ** 3).toFixed(2),
         workDirGB: +(workBytes / 1024 ** 3).toFixed(2),
         cpus: os.cpus().length,
       },

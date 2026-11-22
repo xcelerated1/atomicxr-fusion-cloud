@@ -34,11 +34,22 @@ export async function tileInfo(dir, expect) {
 
 /** Unzip with Windows' own tar (bsdtar reads zip), falling back to PowerShell. Never Git Bash's GNU tar: it reads "D:" as a host. */
 export async function unzip(zip, outDir, log = console.log) {
-  const tar = process.platform === "win32" ? path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe") : "tar";
+  // Linux (the cloud container): GNU tar can't read zip files, so use `unzip` if present, else Python's zipfile
+  // (the OpenDroneMap image always has python3).
+  if (process.platform !== "win32") {
+    try {
+      await run("unzip", ["-q", "-o", zip, "-d", outDir], { timeout: 3_600_000, maxBuffer: 1 << 24 });
+    } catch (e) {
+      log("unzip unavailable or failed, using python zipfile:", String(e.message).split("\n")[0]);
+      await run("python3", ["-c", "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])", zip, outDir], { timeout: 3_600_000, maxBuffer: 1 << 24 });
+    }
+    return;
+  }
+  // Windows: its own bsdtar (System32) reads zip; PowerShell as a fallback.
+  const tar = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe");
   try {
     await run(tar, ["-xf", zip, "-C", outDir], { timeout: 3_600_000, maxBuffer: 1 << 24 });
   } catch (e) {
-    if (process.platform !== "win32") throw e;
     log("tar failed, using Expand-Archive:", e.message.split("\n")[0]);
     await run("powershell.exe", ["-NoProfile", "-Command", `Expand-Archive -LiteralPath '${zip}' -DestinationPath '${outDir}' -Force`], { timeout: 7_200_000, maxBuffer: 1 << 24 });
   }

@@ -26,7 +26,7 @@ ENV FUSION_WORKER_MODE=cloud \
     FUSION_NODEODM=http://127.0.0.1:3000 \
     FUSION_WORK_DIR=/var/fusion/jobs \
     FUSION_ODM_PYTHON=/usr/bin/python3 \
-    FUSION_MAX_PHOTOS=120 \
-    FUSION_MAX_GB=3
+    FUSION_MAX_PHOTOS=60 \
+    FUSION_MAX_GB=1.5
 
 ENTRYPOINT ["/bin/bash", "/fusion/entrypoint.sh"]
