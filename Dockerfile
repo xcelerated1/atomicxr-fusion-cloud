@@ -1,4 +1,4 @@
-# ATOMICXR FUSION Cloud processing container (Bunny Magic Containers).
+# FUSION Cloud processing container (for Bunny Magic Containers, once approved).
 # = the official OpenDroneMap NodeODM 3.6.2 image (same engine version as FUSION Desktop)
 # + the FUSION worker, which only makes outbound requests to atomicxr.com (no open ports needed).
 # Built by GitHub Actions (.github/workflows/build.yml) and published to ghcr.io/xcelerated1/fusion-cloud.
@@ -25,7 +25,7 @@ ENV FUSION_WORKER_MODE=cloud \
     FUSION_SERVER=https://atomicxr.com \
     FUSION_NODEODM=http://127.0.0.1:3000 \
     FUSION_WORK_DIR=/var/fusion/jobs \
-    FUSION_ODM_PYTHON=/usr/bin/python3 \
+    FUSION_ODM_PYTHON=/code/venv/bin/python3 \
     FUSION_MAX_PHOTOS=60 \
     FUSION_MAX_GB=1.5
 
